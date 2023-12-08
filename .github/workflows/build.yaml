@@ -109,7 +109,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: ghcr.io/${{ github.repository }}/kubeip-agent
+          images: ghcr.io/${{ github.repository }}-agent
           tags: |
             type=ref,event=branch
             type=ref,event=pr
