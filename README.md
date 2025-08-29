@@ -6,7 +6,7 @@ Welcome to KubeIP v2, a complete overhaul of the popular [DoiT](https://www.doit
 KubeIP [v1-main](https://github.com/doitintl/kubeip/tree/v1-main) open-source project, originally developed
 by [Aviv Laufer](https://github.com/avivl).
 
-KubeIP v2 expands its support beyond Google Cloud (as in v1) to include AWS, and it's designed to be extendable to other cloud providers
+KubeIP v2 expands its support beyond Google Cloud (as in v1) to include AWS and Oracle Cloud Infrastructure(OCI), and it's designed to be extendable to other cloud providers
 that allow assigning static public IP to VMs. We've also transitioned from a Kubernetes controller to a standard DaemonSet, enhancing
 reliability and ease of use.
 
@@ -48,7 +48,7 @@ To enable IPv6 support, set the `ipv6` flag (or set `IPV6` environment variable)
 
 ### Kubernetes Service Account
 
-KubeIP requires a Kubernetes service account with the following permissions:
+KubeIP requires a Kubernetes service account with at least the following permissions:
 
 ```yaml
 apiVersion: v1
@@ -66,6 +66,9 @@ rules:
   - apiGroups: [ "" ]
     resources: [ "nodes" ]
     verbs: [ "get" ]
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    verbs: [ "create", "get", "delete" ]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -124,6 +127,65 @@ spec:
               value: debug
             - name: LOG_JSON
               value: "true"
+```
+
+### Node Taints
+
+KubeIP can be configured to attempt removal of a Taint Key from its node once the static IP has been successfully assigned, preventing
+workloads from being scheduled on the node until it has successfully received a static IP address. This can be useful, for example, in cases
+where the workload must call resources with IP-whitelisting, to prevent race conditions between KubeIP and the workload on newly provisioned
+nodes.
+
+To enable this feature, set the `taint-key` configuration parameter (See [How to run KubeIP](#how-to-run-kubeip)) to the taint key that
+should be removed. Then add a toleration to the KubeIP DaemonSet, so that it itself can be scheduled on the tainted nodes. For example,
+given that new nodes are created with a taint key of `kubeip.com/not-ready`:
+
+```yaml
+kind: DaemonSet
+spec:
+  template:
+    spec:
+      serviceAccountName: kubeip-service-account
+      tolerations:
+        - key: kubeip.com/not-ready
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+        - name: kubeip
+          image: doitintl/kubeip-agent
+          env:
+            - name: TAINT_KEY
+              value: kubeip.com/not-ready
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+```
+
+The parameter has no default value, and if not set, KubeIP will not attempt to remove any taints. If the provided Taint Key is not present
+on the node, KubeIP will simply log this fact and continue normally without attempting to remove it. If the Taint Key is present, but
+removing it fails for some reason, KubeIP will release the IP address back into the pool before restarting and trying again.
+
+Using this feature requires KubeIP to have permission to patch nodes. To use this feature, the `ClusterRole` resource rules need to be
+updated. **Note that if this configuration option is not set, KubeIP will not attempt to patch any nodes, and the change to the rules is not
+necessary.**
+
+Please keep in mind that this will give KubeIP permission to make updates to any node in your cluster, so please make sure that this aligns
+with your security requirements before enabling this feature!
+
+```yaml
+rules:
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "patch" ]
 ```
 
 ### AWS
@@ -190,6 +252,93 @@ To use this feature, add the `filter` flag (or set `FILTER` environment variable
   value: "labels.env=dev;labels.app=streamer"
 ```
 
+### Oracle Cloud Infrastructure (OCI)
+
+Make sure that KubeIP DaemonSet is deployed on nodes that have a public IP (node running in public subnet). Set the [compartment OCID](https://docs.oracle.com/en-us/iaas/Content/GSG/Tasks/contactingsupport_topic-Locating_Oracle_Cloud_Infrastructure_IDs.htm#Finding_the_OCID_of_a_Compartment) in the `project` flag (or
+set `FILTER` environment variable) to the KubeIP DaemonSet:
+
+```yaml
+- name: PROJECT
+  value: "ocid1.compartment.oc1..test"
+```
+
+KubeIP will also need certain permissions to communicate with the OCI APIs. Follow these steps to set up the necessary permissions and generate the required API key and place it in the KubeIP DaemonSet:
+
+1. Create a [user and group](https://docs.oracle.com/en/cloud/paas/integration-cloud/oracle-integration-gov/create-iam-group.html) in the OCI console and add the following [policy](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingpolicies.htm) to the group:
+
+   ```
+   Allow group <group_ocid> to manage public-ips in compartment id <compartment_ocid>
+   Allow group <group_ocid> to manage private-ips in compartment id <compartment_ocid>
+   Allow group <group_ocid> to manage vcns in compartment id <compartment_ocid>
+   ```
+
+2. Generate an [API Key](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#two) for the user and download the private key. Config file will look like this:
+
+   ```
+   [DEFAULT]
+   user=ocid1.user.oc1..test
+   fingerprint=
+   key_file=/root/.oci/oci_api_key.pem
+   tenancy=ocid1.tenancy.oc1..test
+   region=us-ashburn-1
+   ```
+
+3. Add the following [secret](https://kubernetes.io/docs/concepts/configuration/secret/) to the KubeIP DaemonSet:
+
+   ```yaml
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: kubeip-oci-secret
+     namespace: kube-system
+   type: Opaque
+   data:
+     config: <base64_encoded_oci_config>
+     oci_api_key.pem: <base64_encoded_oci_api_key>
+   ```
+
+4. Create a volume and mount in the KubeIP DaemonSet to mount the secret:
+
+   ```yaml
+   volumes:
+     - name: oci-config
+       secret:
+         secretName: kubeip-oci-secret
+   ```
+
+   ```yaml
+   volumeMounts:
+     - name: oci-config
+       mountPath: /root/.oci
+   ```
+
+5. Add the following environment variables to the KubeIP DaemonSet:
+   ```yaml
+   - name: OCI_CONFIG_FILE
+     value: /root/.oci/config
+   ```
+
+KubeIP supports filtering of reserved Public IPs using tags. To use this feature, add the `filter` flag (or
+set `FILTER` environment variable) to the KubeIP DaemonSet:
+
+```yaml
+- name: FILTER
+  value: "freeformTags.env=dev"
+```
+
+KubeIP OCI filter supports the following filter syntax:
+
+- `freeformTags.<key>=<value>`
+
+To specify multiple filters, separate them with a semicolon (`;`). For example:
+
+```yaml
+- name: FILTER
+  value: "freeformTags.env=dev;freeformTags.app=streamer"
+```
+
+In the case of multiple filters, they are joined with an `AND`, and the request returns only results that match all the specified filters.
+
 ## How to contribute to KubeIP?
 
 KubeIP is an open-source project, and we welcome your contributions!
@@ -225,11 +374,14 @@ OPTIONS:
    --kubeconfig value                 path to Kubernetes configuration file (not needed if running in node) [$KUBECONFIG]
    --node-name value                  Kubernetes node name (not needed if running in node) [$NODE_NAME]
    --order-by value                   order by for the IP addresses [$ORDER_BY]
-   --project value                    name of the GCP project or the AWS account ID (not needed if running in node) [$PROJECT]
-   --region value                     name of the GCP region or the AWS region (not needed if running in node) [$REGION]
+   --project value                    name of the GCP project or the AWS account ID (not needed if running in node) or OCI compartment OCID (required for OCI) [$PROJECT]
+   --region value                     name of the GCP region or the AWS region or the OCI region (not needed if running in node) [$REGION]
    --release-on-exit                  release the static public IP address on exit (default: true) [$RELEASE_ON_EXIT]
+   --taint-key value                  specify a taint key to remove from the node once the static public IP address is assigned [$TAINT_KEY]
    --retry-attempts value             number of attempts to assign the static public IP address (default: 10) [$RETRY_ATTEMPTS]
    --retry-interval value             when the agent fails to assign the static public IP address, it will retry after this interval (default: 5m0s) [$RETRY_INTERVAL]
+   --lease-duration value             duration of the kubernetes lease (default: 5) [$LEASE_DURATION]
+   --lease-namespace value            namespace of the kubernetes lease (default: "default") [$LEASE_NAMESPACE]
 
    Development
 

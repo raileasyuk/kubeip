@@ -9,6 +9,7 @@ import (
 
 	"github.com/doitintl/kubeip/internal/address"
 	"github.com/doitintl/kubeip/internal/config"
+	"github.com/doitintl/kubeip/internal/lease"
 	nd "github.com/doitintl/kubeip/internal/node"
 	"github.com/doitintl/kubeip/internal/types"
 	"github.com/pkg/errors"
@@ -23,7 +24,10 @@ import (
 type contextKey string
 
 const (
-	developModeKey contextKey = "develop-mode"
+	developModeKey       contextKey = "develop-mode"
+	unassignTimeout                 = 5 * time.Minute
+	kubeipLockName                  = "kubeip-lock"
+	defaultLeaseDuration            = 5
 )
 
 var (
@@ -78,44 +82,122 @@ func prepareLogger(level string, json bool) *logrus.Entry {
 	return log
 }
 
-func assignAddress(c context.Context, log *logrus.Entry, assigner address.Assigner, node *types.Node, cfg *config.Config) error {
+func assignAddress(c context.Context, log *logrus.Entry, client kubernetes.Interface, assigner address.Assigner, node *types.Node, cfg *config.Config) (string, error) {
 	ctx, cancel := context.WithCancel(c)
 	defer cancel()
-	// retry counter
-	retryCounter := 0
+
 	// ticker for retry interval
 	ticker := time.NewTicker(cfg.RetryInterval)
 	defer ticker.Stop()
 
-	for {
-		err := assigner.Assign(ctx, node.Instance, node.Zone, cfg.Filter, cfg.OrderBy)
-		if err != nil && errors.Is(err, address.ErrStaticIPAlreadyAssigned) {
-			log.Infof("static public IP address already assigned to node instance %s", node.Instance)
-			return nil
-		}
-		if err != nil {
-			log.WithError(err).Errorf("failed to assign static public IP address to node %s", node.Name)
-			if retryCounter < cfg.RetryAttempts {
-				retryCounter++
-				log.Infof("retrying after %v", cfg.RetryInterval)
-			} else {
-				log.Infof("reached maximum number of retries (%d)", cfg.RetryAttempts)
-				return errors.Wrap(err, "reached maximum number of retries")
+	// create new cluster wide lock
+	lock := lease.NewKubeLeaseLock(client, kubeipLockName, cfg.LeaseNamespace, node.Instance, cfg.LeaseDuration)
+
+	for retryCounter := 0; retryCounter <= cfg.RetryAttempts; retryCounter++ {
+		log.WithFields(logrus.Fields{
+			"node":           node.Name,
+			"instance":       node.Instance,
+			"filter":         cfg.Filter,
+			"retry-counter":  retryCounter,
+			"retry-attempts": cfg.RetryAttempts,
+		}).Debug("assigning static public IP address to node")
+		assignedAddress, err := func(ctx context.Context) (string, error) {
+			if err := lock.Lock(ctx); err != nil {
+				return "", errors.Wrap(err, "failed to acquire lock")
 			}
-			select {
-			case <-ticker.C:
-				continue
-			case <-ctx.Done():
-				return errors.Wrap(err, "context is done")
+			log.Debug("lock acquired")
+			defer func() {
+				lock.Unlock(ctx) //nolint:errcheck
+				log.Debug("lock released")
+			}()
+			assignedAddress, err := assigner.Assign(ctx, node.Instance, node.Zone, cfg.Filter, cfg.OrderBy)
+			if err != nil {
+				return "", err //nolint:wrapcheck
 			}
+			return assignedAddress, nil
+		}(c)
+		if err == nil || errors.Is(err, address.ErrStaticIPAlreadyAssigned) {
+			return assignedAddress, nil
 		}
-		return nil
+
+		log.WithError(err).WithFields(logrus.Fields{
+			"node":     node.Name,
+			"instance": node.Instance,
+		}).Error("failed to assign static public IP address to node")
+		log.Infof("retrying after %v", cfg.RetryInterval)
+
+		select {
+		case <-ticker.C:
+			continue
+		case <-ctx.Done():
+			// If the context is done, return an error indicating that the operation was cancelled
+			return "", errors.Wrap(ctx.Err(), "context cancelled while assigning addresses")
+		}
 	}
+	return "", errors.New("reached maximum number of retries")
+}
+
+func waitForAddressToBeReported(c context.Context, log *logrus.Entry, explorer nd.Explorer, node *types.Node, assignedAddress string, cfg *config.Config) error {
+	ctx, cancel := context.WithCancel(c)
+	defer cancel()
+
+	// ticker for retry interval
+	ticker := time.NewTicker(cfg.RetryInterval)
+	defer ticker.Stop()
+
+	for retryCounter := 0; retryCounter <= cfg.RetryAttempts; retryCounter++ {
+		log.WithFields(logrus.Fields{
+			"node":           node.Name,
+			"instance":       node.Instance,
+			"address":        assignedAddress,
+			"retry-counter":  retryCounter,
+			"retry-attempts": cfg.RetryAttempts,
+		}).Debug("Waiting for node to report assigned address")
+
+		nodeInfo, err := explorer.GetNode(ctx, node.Name)
+		if err == nil {
+			for _, ip := range nodeInfo.ExternalIPs {
+				if ip.String() == assignedAddress {
+					log.WithFields(logrus.Fields{
+						"node":           node.Name,
+						"instance":       node.Instance,
+						"address":        assignedAddress,
+						"retry-counter":  retryCounter,
+						"retry-attempts": cfg.RetryAttempts,
+					}).Info("Node is reporting assigned address")
+					return nil
+				}
+			}
+			log.WithError(err).WithFields(logrus.Fields{
+				"node":     node.Name,
+				"instance": node.Instance,
+				"address":  assignedAddress,
+			}).Warn("Node is not yet reporting the assigned address")
+		} else {
+			log.WithError(err).WithFields(logrus.Fields{
+				"node":     node.Name,
+				"instance": node.Instance,
+				"address":  assignedAddress,
+			}).Error("failed to check if node is reporting the assigned address")
+		}
+
+		log.Infof("retrying after %v", cfg.RetryInterval)
+
+		select {
+		case <-ticker.C:
+			continue
+		case <-ctx.Done():
+			// If the context is done, return an error indicating that the operation was cancelled
+			return errors.Wrap(ctx.Err(), "context cancelled while waiting for node to report assigned address")
+		}
+	}
+	return errors.New("reached maximum number of retries")
 }
 
 func run(c context.Context, log *logrus.Entry, cfg *config.Config) error {
 	ctx, cancel := context.WithCancel(c)
 	defer cancel()
+
 	// add debug mode to context
 	if cfg.DevelopMode {
 		ctx = context.WithValue(ctx, developModeKey, true)
@@ -144,29 +226,58 @@ func run(c context.Context, log *logrus.Entry, cfg *config.Config) error {
 	if err != nil {
 		return errors.Wrap(err, "initializing assigner")
 	}
-	// assign static public IP address
-	errorCh := make(chan error)
-	go func() {
-		e := assignAddress(ctx, log, assigner, n, cfg)
-		if e != nil {
-			errorCh <- e
-		}
-	}()
 
-	select {
-	case err = <-errorCh:
+	assignedAddress, err := assignAddress(ctx, log, clientset, assigner, n, cfg)
+	if err != nil {
+		return errors.Wrap(err, "assigning static public IP address")
+	}
+
+	if cfg.TaintKey != "" {
+		if err := waitForAddressToBeReported(ctx, log, explorer, n, assignedAddress, cfg); err != nil {
+			return errors.Wrap(err, "waiting for node to report assigned address")
+		}
+
+		logger := log.WithField("taint-key", cfg.TaintKey)
+		tainter := nd.NewTainter(clientset)
+
+		didRemoveTaint, err := tainter.RemoveTaintKey(ctx, n, cfg.TaintKey)
 		if err != nil {
-			return errors.Wrap(err, "assigning static public IP address")
-		}
-	case <-ctx.Done():
-		log.Infof("kubeip agent stopped")
-		if cfg.ReleaseOnExit {
-			log.Infof("releasing static public IP address")
-			// use a different context for releasing the static public IP address since the main context is canceled
-			if err = assigner.Unassign(context.Background(), n.Instance, n.Zone); err != nil {
-				return errors.Wrap(err, "releasing static public IP address")
+			logger.Error("removing taint key failed, releasing static public IP address")
+			if releaseErr := releaseIP(assigner, n); releaseErr != nil { //nolint:contextcheck
+				log.WithError(releaseErr).Error("releasing static public IP address after taint key removal failed")
 			}
+			return errors.Wrap(err, "removing node taint key")
 		}
+
+		if didRemoveTaint {
+			logger.Info("taint key removed successfully")
+		} else {
+			logger.Warning("taint key not present on node, skipped removal")
+		}
+	}
+
+	// pause the agent to prevent it from exiting immediately after assigning the static public IP address
+	// wait for the context to be done: SIGTERM, SIGINT
+	<-ctx.Done()
+	log.Infof("shutting down kubeip agent")
+
+	// release the static public IP address on exit
+	if cfg.ReleaseOnExit {
+		log.Infof("releasing static public IP address")
+		if releaseErr := releaseIP(assigner, n); releaseErr != nil { //nolint:contextcheck
+			return releaseErr
+		}
+		log.Infof("static public IP address released")
+	}
+	return nil
+}
+
+func releaseIP(assigner address.Assigner, n *types.Node) error {
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), unassignTimeout)
+	defer releaseCancel()
+
+	if err := assigner.Unassign(releaseCtx, n.Instance, n.Zone); err != nil {
+		return errors.Wrap(err, "failed to release static public IP address")
 	}
 
 	return nil
@@ -179,7 +290,8 @@ func runCmd(c *cli.Context) error {
 	cfg := config.NewConfig(c)
 
 	if err := run(ctx, log, cfg); err != nil {
-		log.Fatalf("eks-lens agent failed: %v", err)
+		log.WithError(err).Error("error running kubeip agent")
+		return err
 	}
 
 	return nil
@@ -204,13 +316,13 @@ func main() {
 					},
 					&cli.StringFlag{
 						Name:     "project",
-						Usage:    "name of the GCP project or the AWS account ID (not needed if running in node)",
+						Usage:    "name of the GCP project or the AWS account ID (not needed if running in node) or OCI compartment OCID (required for OCI)",
 						EnvVars:  []string{"PROJECT"},
 						Category: "Configuration",
 					},
 					&cli.StringFlag{
 						Name:     "region",
-						Usage:    "name of the GCP region or the AWS region (not needed if running in node)",
+						Usage:    "name of the GCP region or the AWS region or the OCI region (not needed if running in node)",
 						EnvVars:  []string{"REGION"},
 						Category: "Configuration",
 					},
@@ -252,12 +364,32 @@ func main() {
 						EnvVars:  []string{"RETRY_ATTEMPTS"},
 						Category: "Configuration",
 					},
+					&cli.IntFlag{
+						Name:     "lease-duration",
+						Usage:    "duration of the kubernetes lease",
+						Value:    defaultLeaseDuration,
+						EnvVars:  []string{"LEASE_DURATION"},
+						Category: "Configuration",
+					},
+					&cli.StringFlag{
+						Name:     "lease-namespace",
+						Usage:    "namespace of the kubernetes lease",
+						EnvVars:  []string{"LEASE_NAMESPACE"},
+						Value:    "default", // default namespace
+						Category: "Configuration",
+					},
 					&cli.BoolFlag{
 						Name:     "release-on-exit",
 						Usage:    "release the static public IP address on exit",
 						EnvVars:  []string{"RELEASE_ON_EXIT"},
 						Category: "Configuration",
 						Value:    true,
+					},
+					&cli.StringFlag{
+						Name:     "taint-key",
+						Usage:    "specify a taint key to remove from the node once the static public IP address is assigned",
+						EnvVars:  []string{"TAINT_KEY"},
+						Category: "Configuration",
 					},
 					&cli.StringFlag{
 						Name:     "log-level",
@@ -286,7 +418,7 @@ func main() {
 		Usage:   "replaces the node's public IP address with a static public IP (IPv4/IPv6) address",
 		Version: version,
 	}
-	cli.VersionPrinter = func(c *cli.Context) {
+	cli.VersionPrinter = func(_ *cli.Context) {
 		fmt.Printf("kubeip-agent %s\n", version)
 		fmt.Printf("  Build date: %s\n", buildDate)
 		fmt.Printf("  Git commit: %s\n", gitCommit)

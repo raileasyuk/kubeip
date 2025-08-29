@@ -16,7 +16,7 @@ var (
 )
 
 type Assigner interface {
-	Assign(ctx context.Context, instanceID, zone string, filter []string, orderBy string) error
+	Assign(ctx context.Context, instanceID, zone string, filter []string, orderBy string) (string, error)
 	Unassign(ctx context.Context, instanceID, zone string) error
 }
 
@@ -27,6 +27,8 @@ func NewAssigner(ctx context.Context, logger *logrus.Entry, provider types.Cloud
 		return &azureAssigner{}, nil
 	} else if provider == types.CloudProviderGCP {
 		return NewGCPAssigner(ctx, logger, cfg.Project, cfg.Region, cfg.IPv6)
+	} else if provider == types.CloudProviderOCI {
+		return NewOCIAssigner(ctx, logger, cfg)
 	}
 	return nil, ErrUnknownCloudProvider
 }

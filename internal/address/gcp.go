@@ -28,6 +28,10 @@ const (
 	maxRetries                  = 10 // number of retries for assigning ephemeral public IP address
 )
 
+var (
+	ErrNoPublicIPAssigned = errors.New("no public IP address assigned to the instance")
+)
+
 type internalAssigner interface {
 	CheckAddressAssigned(region, addressName string) (bool, error)
 	AddInstanceAddress(ctx context.Context, instance *compute.Instance, zone string, address *compute.Address) error
@@ -210,20 +214,23 @@ func (a *gcpAssigner) CheckAddressAssigned(region, addressName string) (bool, er
 	return address.Status == inUseStatus, nil
 }
 
-func (a *gcpAssigner) Assign(ctx context.Context, instanceID, zone string, filter []string, orderBy string) error {
+func (a *gcpAssigner) Assign(ctx context.Context, instanceID, zone string, filter []string, orderBy string) (string, error) {
 	// check if instance already has a public static IP address assigned
-	instance, err := a.checkStaticIPAssigned(zone, instanceID)
+	instance, address, err := a.checkStaticIPAssigned(zone, instanceID)
 	if err != nil {
-		return errors.Wrapf(err, "check if static public IP is already assigned to instance %s", instanceID)
+		if errors.Is(err, ErrStaticIPAlreadyAssigned) {
+			return address, nil
+		}
+		return "", errors.Wrapf(err, "check if static public IP is already assigned to instance %s", instanceID)
 	}
 
 	// get available reserved public IP addresses
 	addresses, err := a.listAddresses(filter, orderBy, reservedStatus)
 	if err != nil {
-		return errors.Wrap(err, "failed to list available addresses")
+		return "", errors.Wrap(err, "failed to list available addresses")
 	}
 	if len(addresses) == 0 {
-		return errors.Errorf("no available addresses")
+		return "", errors.Errorf("no available addresses")
 	}
 	// log available addresses IPs
 	ips := make([]string, 0, len(addresses))
@@ -233,48 +240,54 @@ func (a *gcpAssigner) Assign(ctx context.Context, instanceID, zone string, filte
 	a.logger.WithField("addresses", ips).Debugf("found %d available addresses", len(addresses))
 
 	// delete current ephemeral public IP address
-	if err = a.DeleteInstanceAddress(ctx, instance, zone); err != nil {
-		return errors.Wrap(err, "failed to delete current public IP address")
+	if err = a.DeleteInstanceAddress(ctx, instance, zone); err != nil && !errors.Is(err, ErrNoPublicIPAssigned) {
+		return "", errors.Wrap(err, "failed to delete current public IP address")
 	}
 
 	// get instance details again to refresh the network interface fingerprint (required for adding a new ipv6 address)
 	instance, err = a.instanceGetter.Get(a.project, zone, instanceID)
 	if err != nil {
-		return errors.Wrapf(err, "failed refresh network interface fingerprint for instance %s", instanceID)
+		return "", errors.Wrapf(err, "failed refresh network interface fingerprint for instance %s", instanceID)
 	}
 
 	// try to assign all available addresses until one succeeds
 	// due to concurrency, it is possible that another kubeip instance will assign the same address
+	var assignedAddress string
 	for _, address := range addresses {
+		// check if context is done before trying to assign an address
+		if ctx.Err() != nil {
+			return "", errors.Wrap(ctx.Err(), "context cancelled while assigning addresses")
+		}
 		if err = tryAssignAddress(ctx, a, instance, a.region, zone, address); err != nil {
-			a.logger.WithError(err).Errorf("failed to assign static public IP address %s", address.Address)
+			a.logger.WithError(err).WithField("address", address.Address).Error("failed to assign static public IP address")
 			continue
 		}
+		assignedAddress = address.Address
 		// break the loop after successfully assigning an address
 		break
 	}
 	if err != nil {
-		return errors.Wrap(err, "failed to assign static public IP address")
+		return "", errors.Wrap(err, "failed to assign static public IP address")
 	}
-	return nil
+	return assignedAddress, nil
 }
 
-func (a *gcpAssigner) checkStaticIPAssigned(zone, instanceID string) (*compute.Instance, error) {
+func (a *gcpAssigner) checkStaticIPAssigned(zone, instanceID string) (*compute.Instance, string, error) {
 	instance, err := a.instanceGetter.Get(a.project, zone, instanceID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get instance %s", instanceID)
+		return nil, "", errors.Wrapf(err, "failed to get instance %s", instanceID)
 	}
 	assigned, err := a.listAddresses(nil, "", inUseStatus)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to list assigned addresses")
+		return nil, "", errors.Wrap(err, "failed to list assigned addresses")
 	}
 	// create a map of users for quick lookup
 	users := a.createUserMap(assigned)
 	// check if the instance's self link is in the list of users
-	if _, ok := users[instance.SelfLink]; ok {
-		return nil, ErrStaticIPAlreadyAssigned
+	if address, ok := users[instance.SelfLink]; ok {
+		return nil, address, ErrStaticIPAlreadyAssigned
 	}
-	return instance, nil
+	return instance, "", nil
 }
 
 func (a *gcpAssigner) listAddresses(filter []string, orderBy, status string) ([]*compute.Address, error) {
@@ -355,12 +368,12 @@ func (a *gcpAssigner) Unassign(ctx context.Context, instanceID, zone string) err
 func getAccessConfig(networkInterface *compute.NetworkInterface, ipv6 bool) (*compute.AccessConfig, error) {
 	if ipv6 {
 		if len(networkInterface.Ipv6AccessConfigs) == 0 {
-			return nil, errors.New("instance network interface has no IPv6 access configs")
+			return nil, ErrNoPublicIPAssigned
 		}
 		return networkInterface.Ipv6AccessConfigs[0], nil
 	}
 	if len(networkInterface.AccessConfigs) == 0 {
-		return nil, errors.New("instance network interface has no access configs")
+		return nil, ErrNoPublicIPAssigned
 	}
 	return networkInterface.AccessConfigs[0], nil
 }
@@ -388,11 +401,11 @@ func tryAssignAddress(ctx context.Context, as internalAssigner, instance *comput
 	return nil
 }
 
-func (a *gcpAssigner) createUserMap(assigned []*compute.Address) map[string]struct{} {
-	users := make(map[string]struct{})
+func (a *gcpAssigner) createUserMap(assigned []*compute.Address) map[string]string {
+	users := make(map[string]string)
 	for _, address := range assigned {
 		for _, user := range address.Users {
-			users[user] = struct{}{}
+			users[user] = address.Address
 		}
 	}
 	return users
@@ -400,6 +413,10 @@ func (a *gcpAssigner) createUserMap(assigned []*compute.Address) map[string]stru
 
 func retryAddEphemeralAddress(ctx context.Context, logger *logrus.Entry, as internalAssigner, instance *compute.Instance, zone string) error {
 	for i := 0; i < maxRetries; i++ {
+		// check if context is done before trying to assign an address
+		if ctx.Err() != nil {
+			return errors.Wrap(ctx.Err(), "context cancelled while assigning ephemeral addresses")
+		}
 		if err := as.AddInstanceAddress(ctx, instance, zone, nil); err != nil {
 			logger.WithError(err).Error("failed to assign ephemeral public IP address, retrying")
 			continue
