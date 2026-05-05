@@ -10,6 +10,7 @@ KubeIP v2 expands its support beyond Google Cloud (as in v1) to include AWS and 
 that allow assigning static public IP to VMs. We've also transitioned from a Kubernetes controller to a standard DaemonSet, enhancing
 reliability and ease of use.
 
+
 ## What happens with KubeIP v1
 
 KubeIP v1 is still available in the [v1-main](https://github.com/doitintl/kubeip/tree/v1-main) branch. No further development is planned. We
